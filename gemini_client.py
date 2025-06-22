@@ -4,6 +4,9 @@ import os
 import re
 from pathlib import Path
 from typing import Any, List, Optional, Type, Union
+import time
+import threading
+from collections import deque
 
 import PIL.Image
 from dotenv import load_dotenv
@@ -34,6 +37,58 @@ def _log_retry_attempt(retry_state):
     )
 
 
+class RateLimiter:
+    """A thread-safe rate limiter that restricts calls to a specified number of requests per minute."""
+
+    def __init__(self, requests_per_minute: Optional[int]):
+        """
+        Initializes the rate limiter.
+
+        Args:
+            requests_per_minute: The number of allowed requests per minute. If None or <= 0,
+                                 the rate limiter is disabled.
+        """
+        if requests_per_minute is None or requests_per_minute <= 0:
+            self.enabled = False
+            return
+
+        self.enabled = True
+        self.requests_per_minute = requests_per_minute
+        self.period_seconds = 60.0
+        self.request_timestamps = deque()
+        self.lock = threading.Lock()
+        logging.info("Rate limiter enabled: %d requests per minute.", self.requests_per_minute)
+
+    def __call__(self):
+        """
+        Blocks until a request can be made, respecting the rate limit.
+
+        If the rate limiter is disabled, this method returns immediately.
+        Otherwise, it sleeps if necessary to ensure the number of requests
+        in the last minute does not exceed the configured limit.
+        """
+        if not self.enabled:
+            return
+
+        with self.lock:
+            while True:
+                current_time = time.monotonic()
+                # Remove timestamps older than the defined period.
+                while (
+                    self.request_timestamps
+                    and self.request_timestamps[0] <= current_time - self.period_seconds
+                ):
+                    self.request_timestamps.popleft()
+
+                if len(self.request_timestamps) < self.requests_per_minute:
+                    self.request_timestamps.append(current_time)
+                    break
+                else:
+                    # Calculate how long to wait for the oldest request to expire.
+                    wait_time = self.request_timestamps[0] + self.period_seconds - current_time
+                    time.sleep(wait_time)
+
+
 class GeminiClient:
     """A small convenience wrapper around the google-genai client."""
 
@@ -44,6 +99,8 @@ class GeminiClient:
         - ``GEMINI_API_KEY``: The Gemini API key.
         - ``GEMINI_MODEL``: Name of the generative model to use (defaults to "gemini-2.5-flash").
         - ``GEMINI_EMBEDDING_MODEL``: Name of the embedding model to use (defaults to "text-embedding-004").
+        - ``GEMINI_RPM_LIMIT``: Max requests per minute for the generative model (e.g., 50).
+        - ``GEMINI_EMBEDDING_RPM_LIMIT``: Max requests per minute for the embedding model (e.g., 1000).
         """
 
         default_model = "gemini-2.5-flash"
@@ -52,6 +109,15 @@ class GeminiClient:
         default_embedding_model = "text-embedding-004"
         self.embedding_model_name = os.environ.get(
             "GEMINI_EMBEDDING_MODEL", default_embedding_model
+        )
+
+        # Rate limiting configuration
+        rpm_limit = os.environ.get("GEMINI_RPM_LIMIT")
+        self.rpm_limiter = RateLimiter(int(rpm_limit) if rpm_limit else 50)
+
+        embedding_rpm_limit = os.environ.get("GEMINI_EMBEDDING_RPM_LIMIT")
+        self.embedding_rpm_limiter = RateLimiter(
+            int(embedding_rpm_limit) if embedding_rpm_limit else 1000
         )
 
         self.api_key = os.environ.get("GEMINI_API_KEY")
@@ -89,6 +155,7 @@ class GeminiClient:
         The method always returns the *raw* text returned by the model. The
         caller is responsible for any downstream parsing/validation.
         """
+        self.rpm_limiter()
 
         image_path = Path(image_path)
         if not image_path.is_file():
@@ -143,6 +210,7 @@ class GeminiClient:
         The method returns parsed Pydantic objects as specified by the
         `response_schema`.
         """
+        self.rpm_limiter()
         prompt = prompt_template.format(transcription=text_input)
 
         try:
@@ -186,6 +254,7 @@ class GeminiClient:
     )
     def embed_contents(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings for a list of texts in a single batch."""
+        self.embedding_rpm_limiter()
         if not texts:
             return []
         try:

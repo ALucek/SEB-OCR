@@ -83,7 +83,7 @@ def deduplicate_entities_by_similarity(
         )
         final_entities.append(best_entity_in_group)
         logger.info(
-            "Consolidated %d similar entities into one based on latest page.", len(group)
+            "Consolidated %d similar entities into one.", len(group)
         )
 
     logger.info(
