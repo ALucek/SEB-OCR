@@ -2,7 +2,7 @@
 
 <img src="./seb_ocr_logo.png" width=600>
 
-A vision-language pipeline for turning scanned historical pages into structured datasets.  At its core the project leverages Google's [Gemini](https://ai.google.dev/gemini-api/docs/models) family for both vision-OCR and text understanding, built specifically for ongoing political science research.
+A vision-language pipeline for turning scanned historical pages into structured datasets.  At its core the project leverages Google's [Gemini](https://ai.google.dev/gemini-api/docs/models) family for both vision-OCR and text entity extraction, built specifically for ongoing political science research.
 
 **How it works**
 
