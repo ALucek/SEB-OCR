@@ -63,17 +63,20 @@ class RateLimiter:
         """
         Blocks until a request can be made, respecting the rate limit.
 
-        If the rate limiter is disabled, this method returns immediately.
-        Otherwise, it sleeps if necessary to ensure the number of requests
-        in the last minute does not exceed the configured limit.
+        The implementation acquires the lock only for bookkeeping of timestamps and
+        releases it *before* sleeping so that other threads are not blocked while
+        we wait for quota to replenish. This dramatically improves throughput
+        when many threads are contending for the same limiter.
         """
         if not self.enabled:
             return
 
-        with self.lock:
-            while True:
+        while True:
+            # Acquire lock only for the critical section that mutates the deque.
+            with self.lock:
                 current_time = time.monotonic()
-                # Remove timestamps older than the defined period.
+
+                # Drop timestamps outside the rolling window.
                 while (
                     self.request_timestamps
                     and self.request_timestamps[0] <= current_time - self.period_seconds
@@ -82,11 +85,16 @@ class RateLimiter:
 
                 if len(self.request_timestamps) < self.requests_per_minute:
                     self.request_timestamps.append(current_time)
-                    break
-                else:
-                    # Calculate how long to wait for the oldest request to expire.
-                    wait_time = self.request_timestamps[0] + self.period_seconds - current_time
-                    time.sleep(wait_time)
+                    return  # Quota available – proceed immediately.
+
+                # Otherwise compute how long until the oldest entry exits the window.
+                wait_time = (
+                    self.request_timestamps[0] + self.period_seconds - current_time
+                )
+
+            # Sleep *outside* the lock so other threads can run.
+            if wait_time > 0:
+                time.sleep(wait_time)
 
 
 class GeminiClient:
@@ -253,22 +261,36 @@ class GeminiClient:
         before_sleep=_log_retry_attempt,
     )
     def embed_contents(self, texts: list[str]) -> list[list[float]]:
-        """Generate embeddings for a list of texts in a single batch."""
-        self.embedding_rpm_limiter()
+        """Generate embeddings for *texts* while respecting batch-size limits.
+
+        Google's embedding endpoint currently caps requests to 16 texts per call.
+        We therefore chunk the input and make multiple calls when necessary while
+        preserving the original ordering of results.
+        """
+
         if not texts:
             return []
-        try:
-            # The API expects the keyword argument `contents` for batching.
-            result = self._client.models.embed_content(
-                model=self.embedding_model_name, contents=texts
-            )
-            # The response contains a list of ContentEmbedding objects; we need to
-            # extract the `values` (the actual vector) from each one.
-            return [e.values for e in result.embeddings]
-        except google_exceptions.GoogleAPIError:
-            # Propagate Google API errors for tenacity to handle.
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to generate embeddings with Gemini API model: {exc}"
-            ) from exc
+
+        MAX_BATCH_SIZE = 16
+        embeddings: list[list[float]] = []
+
+        for i in range(0, len(texts), MAX_BATCH_SIZE):
+            batch = texts[i : i + MAX_BATCH_SIZE]
+
+            # Apply rate limit per request.
+            self.embedding_rpm_limiter()
+
+            try:
+                result = self._client.models.embed_content(
+                    model=self.embedding_model_name, contents=batch
+                )
+                embeddings.extend([e.values for e in result.embeddings])
+            except google_exceptions.GoogleAPIError:
+                # Propagate Google API errors for tenacity to handle.
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to generate embeddings with Gemini API model: {exc}"
+                ) from exc
+
+        return embeddings
